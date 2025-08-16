@@ -368,13 +368,13 @@ class RobotControl(Node):
             # Guard against invalid DVL or near-floor region; bias UP (negative) and freeze PID
             if (self.altitude is None) or (not self.altitude_valid) or (not math.isfinite(self.altitude)) or (self.altitude < self.floor_guard_m):
                 depth_cmd = self.ascend_bias         # negative = up in your mapping
-                depth_cmd = -depth_cmd   # invert once: error>0 (too high) → command DOWN
-
+                
                 self.alt_pid.auto_mode = False       # avoid I windup when you later add Ki
             else:
                 if not self.alt_pid.auto_mode:
                     self.alt_pid.set_auto_mode(True, last_output=0.0)
                 depth_cmd = self.alt_pid(self._alt_filt)
+                depth_cmd = -depth_cmd
 
 
 
@@ -398,6 +398,7 @@ class RobotControl(Node):
 
         # Vertical: our API uses vertical>0 = "go DOWN".
         if abs(vertical) > 0.01:
+            mag = min(1.0, abs(vertical))
             vel_cmd.linear.z = -max_vertical_velocity if vertical > 0 else +max_vertical_velocity
         else:
             vel_cmd.linear.z = 0.0
@@ -541,5 +542,6 @@ def main(args=None):
 if __name__ == '__main__':
 
     main()
+
 
 
