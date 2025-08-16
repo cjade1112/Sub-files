@@ -230,16 +230,15 @@ class RobotControl(Node):
         return (time.time() - self.last_imu_time) < self.data_timeout
         
     def set_depth(self, target_depth):
-        """User API: request depth below surface (meters). Internally we control altitude = pool_depth - depth."""
-        with self.lock:
-            self.desired_depth_m = float(target_depth)
-            # avoid negative altitude if pool depth estimate is off
-            self.base_alt = max(0.10, self.pool_depth_m - self.desired_depth_m)
-            self.alt_pid.setpoint = self.base_alt
-            # keep desired_point['z'] unused so we don't trigger position target for Z
-            self.desired_point['z'] = None
+        d = float(target_depth)
+        if d < 0:  # accept old negative-down calls; normalize
+            d = -d
+        self.desired_depth_m = d
+        self.base_alt = max(0.10, self.pool_depth_m - d)  # for altitude-hold path
+        self.alt_pid.setpoint = self.base_alt
+        self.desired_point['z'] = None
+        self.get_logger().info(f"Depth SP set: {d:.2f} m → Altitude SP: {self.base_alt:.2f} m")
 
-        self.get_logger().info(f"Depth SP set: {self.desired_depth_m:.2f} m → Altitude SP: {self.base_alt:.2f} m")
 
     def set_max_descent_rate(self, enable):
         """Enable/disable maximum descent rate for initial descent"""
@@ -303,7 +302,18 @@ class RobotControl(Node):
             vision_pose_ok = self.vision_pose_valid and self.check_vision_data_timeout()
             vision_speed_ok = self.vision_velocity_valid and self.check_vision_data_timeout()
             imu_ok = self.imu_valid and self.check_imu_data_timeout()
-            
+
+            now = time.time()
+            if self.debug and vision_pose_ok and (now - getattr(self, "_last_frame_log", 0.0)) > 1.0:
+                self._last_frame_log = now
+                z_enu = float(self.position['z'])
+                depth_down = -z_enu
+                alt = self.altitude if self.altitude is not None else float('nan')
+                sp = self.alt_pid.setpoint if hasattr(self, "alt_pid") else float('nan')
+                self.get_logger().info(
+                    f"[FRAME] z_enu={z_enu:+.3f} m → depth_down={depth_down:+.3f} m | "
+                    f"alt={alt:.2f} m (valid={self.altitude_valid}) | sp={sp:.2f} m"
+                )
             # Initialize control outputs
             forward_cmd = 0.0
             lateral_cmd = 0.0
@@ -358,6 +368,8 @@ class RobotControl(Node):
             # Guard against invalid DVL or near-floor region; bias UP (negative) and freeze PID
             if (self.altitude is None) or (not self.altitude_valid) or (not math.isfinite(self.altitude)) or (self.altitude < self.floor_guard_m):
                 depth_cmd = self.ascend_bias         # negative = up in your mapping
+                depth_cmd = -depth_cmd   # invert once: error>0 (too high) → command DOWN
+
                 self.alt_pid.auto_mode = False       # avoid I windup when you later add Ki
             else:
                 if not self.alt_pid.auto_mode:
@@ -529,4 +541,5 @@ def main(args=None):
 if __name__ == '__main__':
 
     main()
+
 
