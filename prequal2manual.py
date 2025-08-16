@@ -152,7 +152,7 @@ class StraightLeftMission(Node):
             # Done?
             if descent_completed and forward_completed:
                 self.get_logger().info("[MISSION] ✅ Both descent and forward movement completed!")
-            break    
+                break    
                 
                 # Logging every 2 seconds
             if (current_time - last_log_time) >= 2.0:
@@ -378,4 +378,5 @@ def main():
             rclpy.shutdown()
 
 if __name__ == '__main__':
+
     main()
