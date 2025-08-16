@@ -40,7 +40,34 @@ class RobotControl(Node):
         # In your RobotControl.__init__(), add this at the very beginning:
         time.sleep(5.0)  # Wait for MAVROS to fully initialize
         self.get_logger().info("🔄 Waiting for MAVROS to initialize...")
-        
+                # ----- Altitude-hold params (4 ft pool ≈ 1.22 m) -----
+        self.pool_depth_m = 1.22          # adjust if your pool depth differs
+        self.desired_depth_m = 0.20       # you want 0.2 m below surface
+        self.base_alt = self.pool_depth_m - self.desired_depth_m  # => 1.02 m
+
+        self.floor_guard_m = 0.50         # avoid DVL near-floor unreliability
+        self.ascend_bias = -0.25          # negative = UP in your send_velocity_command()
+
+        # Bump-test script (entirely onboard; no comms needed)
+        self.bump_test = True             # set False to disable scripted steps
+        self.bump_delta = 0.05            # +5 cm step
+        self.bump_segment_s = 8.0         # 0–8, 8–16, 16–24s
+
+        # DVL altitude state
+        self.altitude = None
+        self.altitude_valid = False
+        self._alt_filt = None
+        self._alpha = 0.7                 # LPF on measurement to help Kd
+
+        # Altitude PID (Ki = 0 for now)
+        self.alt_pid = PID(0.4, 0.0, 0.10, setpoint=self.base_alt, output_limits=(-0.4, 0.4))
+        self.alt_pid.sample_time = 0.05
+        self.alt_pid.proportional_on_measurement = True
+        self.alt_pid.differential_on_measurement = True
+
+        # clock for the bump test
+        self._t0 = self.get_clock().now()
+
         self.lock = threading.Lock()
         self.debug = True  # Enable debug info
 
@@ -164,17 +191,20 @@ class RobotControl(Node):
         except Exception as e:
             self.get_logger().error(f"MAVROS vision speed callback error: {e}")
 
-    def dvl_range_callback(self, msg):
-        """DVL range to bottom callback (direct from DVL if available)"""
+    def dvl_range_callback(self, msg: Range):
+        """DVL range to bottom callback (altitude from bottom, meters)"""
         try:
             with self.lock:
-                self.range_to_bottom = msg.range
-            
-            if self.debug and not math.isnan(self.range_to_bottom) and time.time() % 5 < 0.1:
-                self.get_logger().info(f"DVL Range to bottom: {self.range_to_bottom:.2f}m")
-                
+                self.range_to_bottom = float(msg.range)
+                self.altitude = self.range_to_bottom
+                self.altitude_valid = (msg.min_range <= msg.range <= msg.max_range)
+
+            if self.debug and self.altitude_valid and not math.isnan(self.range_to_bottom) and time.time() % 5 < 0.1:
+                self.get_logger().info(f"DVL Altitude (range to bottom): {self.range_to_bottom:.2f} m")
+
         except Exception as e:
             self.get_logger().error(f"DVL range callback error: {e}")
+
 
     def imu_orientation_callback(self, msg):
         """IMU orientation callback - still need this for heading control"""
@@ -200,11 +230,16 @@ class RobotControl(Node):
         return (time.time() - self.last_imu_time) < self.data_timeout
         
     def set_depth(self, target_depth):
-        """Set the target depth for the submarine"""
+        """User API: request depth below surface (meters). Internally we control altitude = pool_depth - depth."""
         with self.lock:
-            self.desired_point['z'] = target_depth
-            self.PIDs["depth"].setpoint = float(target_depth)
-        self.get_logger().info(f"Target depth set to: {target_depth}m")
+            self.desired_depth_m = float(target_depth)
+            # avoid negative altitude if pool depth estimate is off
+            self.base_alt = max(0.10, self.pool_depth_m - self.desired_depth_m)
+            self.alt_pid.setpoint = self.base_alt
+            # keep desired_point['z'] unused so we don't trigger position target for Z
+            self.desired_point['z'] = None
+
+        self.get_logger().info(f"Depth SP set: {self.desired_depth_m:.2f} m → Altitude SP: {self.base_alt:.2f} m")
 
     def set_max_descent_rate(self, enable):
         """Enable/disable maximum descent rate for initial descent"""
@@ -297,17 +332,38 @@ class RobotControl(Node):
                     self.get_logger().warn(f"Position targets set but no valid data - {pose_status}, {speed_status}, {imu_status}")
             
            # Depth control (only when a target is set)
-            if self.desired_point['z'] is not None:
-                current_depth_down = -self.position['z']  # ENU z-up -> depth (down+)
-                descent_needed = self.desired_point['z'] - current_depth_down
-            
-                if self.max_descent_mode and descent_needed > 0.1:
-                    depth_cmd = +0.55  # vertical>0 = “go DOWN” in send_velocity_command()
+                        # ---- Altitude hold using DVL (controls distance from bottom) ----
+            # Compute setpoint (with optional scripted bump test)
+            if self.bump_test:
+                t = (self.get_clock().now() - self._t0).nanoseconds * 1e-9
+                if   t < self.bump_segment_s:
+                    sp = self.base_alt
+                elif t < 2*self.bump_segment_s:
+                    sp = self.base_alt + self.bump_delta
+                elif t < 3*self.bump_segment_s:
+                    sp = self.base_alt
                 else:
-                    # simple_pid: pass the measurement; setpoint is set in set_depth()
-                    depth_cmd = self.PIDs["depth"](current_depth_down)
+                    sp = self.base_alt   # hold after 24s
             else:
-                depth_cmd = 0.0
+                sp = self.base_alt
+
+            self.alt_pid.setpoint = sp
+
+            # Measurement low-pass to help Kd
+            if self.altitude is not None:
+                if self._alt_filt is None:
+                    self._alt_filt = self.altitude
+                self._alt_filt = self._alpha*self._alt_filt + (1.0 - self._alpha)*self.altitude
+
+            # Guard against invalid DVL or near-floor region; bias UP (negative) and freeze PID
+            if (self.altitude is None) or (not self.altitude_valid) or (not math.isfinite(self.altitude)) or (self.altitude < self.floor_guard_m):
+                depth_cmd = self.ascend_bias         # negative = up in your mapping
+                self.alt_pid.auto_mode = False       # avoid I windup when you later add Ki
+            else:
+                if not self.alt_pid.auto_mode:
+                    self.alt_pid.set_auto_mode(True, last_output=0.0)
+                depth_cmd = self.alt_pid(self._alt_filt)
+
 
 
 
@@ -473,3 +529,4 @@ def main(args=None):
 if __name__ == '__main__':
 
     main()
+
