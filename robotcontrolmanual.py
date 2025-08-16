@@ -203,6 +203,7 @@ class RobotControl(Node):
         """Set the target depth for the submarine"""
         with self.lock:
             self.desired_point['z'] = target_depth
+            self.PIDs["depth"].setpoint = float(target_depth)
         self.get_logger().info(f"Target depth set to: {target_depth}m")
 
     def set_max_descent_rate(self, enable):
@@ -295,15 +296,19 @@ class RobotControl(Node):
                     imu_status = "IMU_OK" if imu_ok else "IMU_STALE"
                     self.get_logger().warn(f"Position targets set but no valid data - {pose_status}, {speed_status}, {imu_status}")
             
-            # Depth control (always active when target is set) - use MAVROS vision pose z
+           # Depth control (only when a target is set)
             if self.desired_point['z'] is not None:
                 current_depth_down = -self.position['z']  # ENU z-up -> depth (down+)
-                depth_error = self.desired_point['z'] - current_depth_down
-
-            if self.max_descent_mode and depth_error > 0.1:
-                depth_cmd = +0.55  # vertical>0 means “go DOWN” in your send_velocity_command()
+                descent_needed = self.desired_point['z'] - current_depth_down
+            
+                if self.max_descent_mode and descent_needed > 0.1:
+                    depth_cmd = +0.55  # vertical>0 = “go DOWN” in send_velocity_command()
+                else:
+                    # simple_pid: pass the measurement; setpoint is set in set_depth()
+                    depth_cmd = self.PIDs["depth"](current_depth_down)
             else:
-                depth_cmd = self.PIDs["depth"](depth_error)
+                depth_cmd = 0.0
+
 
 
             # Send velocity commands for GUIDED mode
@@ -466,4 +471,5 @@ def main(args=None):
 
 
 if __name__ == '__main__':
+
     main()
